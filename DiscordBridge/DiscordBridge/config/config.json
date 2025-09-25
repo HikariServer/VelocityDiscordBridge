@@ -1,0 +1,9 @@
+{
+  "botToken": "PUT_DISCORD_BOT_TOKEN_HERE",
+  "startupChannelId": "000000000000000000",
+  "bridges": [
+    { "server": "lobby",    "channelId": "111111111111111111" },
+    { "server": "survival", "channelId": "222222222222222222" }
+  ],
+  "enableMessageContentIntent": true
+}

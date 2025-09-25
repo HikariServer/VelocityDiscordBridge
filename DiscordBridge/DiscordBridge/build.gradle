@@ -1,0 +1,49 @@
+plugins {
+    id "java"
+    id "com.github.johnrengelman.shadow" version "8.1.1"
+}
+
+group = "jp.atsukigames"
+version = "0.4.0"
+
+repositories {
+    mavenCentral()
+    maven { url = "https://repo.papermc.io/repository/maven-public/" }
+    maven { url = "https://oss.sonatype.org/content/repositories/snapshots/" }
+}
+
+dependencies {
+    // Velocity API は provided 相当
+    compileOnly "com.velocitypowered:velocity-api:3.4.0-SNAPSHOT"
+
+    // JDA 5（メッセージ双方向連携用）
+    implementation "net.dv8tion:JDA:5.0.0"
+
+    // JSON 設定読み書き用（軽量）
+    implementation "com.google.code.gson:gson:2.10.1"
+
+    // アノテーション（Optional）
+    compileOnly "org.jetbrains:annotations:24.0.1"
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+}
+
+tasks.shadowJar {
+    archiveClassifier.set("")
+    // 必要に応じて relocate（競合回避）
+    // relocate "net.dv8tion.jda", "jp.atsukigames.shadow.net.dv8tion.jda"
+    // relocate "com.google.gson", "jp.atsukigames.shadow.com.google.gson"
+}
+
+tasks.build {
+    dependsOn tasks.shadowJar
+}
