@@ -1,0 +1,2 @@
+# VelocityDiscordBridge
+Velocity専用のDiscordとMinecraftの連携です。
