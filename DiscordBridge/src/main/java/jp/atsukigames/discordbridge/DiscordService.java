@@ -20,6 +20,8 @@ import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -27,8 +29,8 @@ import java.util.logging.Logger;
 public class DiscordService extends ListenerAdapter {
     public static class Config {
         public String botToken;
-        public String channelId;   // Discord->MC ブリッジ
-        public String webhookUrl;  // Webhook 宛先
+        public String channelId;
+        public String webhookUrl;
         public boolean enableMessageContentIntent = true;
     }
 
@@ -40,6 +42,7 @@ public class DiscordService extends ListenerAdapter {
     private Config config;
     private JDA jda;
     private WebhookClient webhookClient;
+    private final Map<String, Boolean> lastOnline = new HashMap<>();
 
     public DiscordService(ProxyServer proxy, Logger logger, Path dataDirectory, Object plugin) {
         this.proxy = proxy;
@@ -55,26 +58,23 @@ public class DiscordService extends ListenerAdapter {
         }
     }
 
-    // 起動: JDA 準備 + Webhook 準備
     public CompletableFuture<Void> start() {
         return CompletableFuture.runAsync(() -> {
             try {
                 if (this.config == null) loadConfig();
                 JDABuilder builder = JDABuilder.createDefault(config.botToken);
-                if (config.enableMessageContentIntent) {
-                    builder.enableIntents(GatewayIntent.MESSAGE_CONTENT);
-                }
+                if (config.enableMessageContentIntent) builder.enableIntents(GatewayIntent.MESSAGE_CONTENT);
                 this.jda = builder.addEventListeners(this).build();
                 this.jda.awaitReady();
 
                 if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
                     WebhookClientBuilder wcb = new WebhookClientBuilder(config.webhookUrl);
                     wcb.setDaemon(true);
-                    this.webhookClient = wcb.build(); // Webhook 経由で Embed 送信[1]
+                    this.webhookClient = wcb.build();
                 }
 
-                // まだ必要な定期処理があればここでスケジュール
-                proxy.getScheduler().buildTask(plugin, () -> {}).repeat(60, TimeUnit.SECONDS).schedule();
+                // 10秒ごとに全 RegisteredServer を ping して状態遷移を検出
+                proxy.getScheduler().buildTask(plugin, this::tickPing).repeat(10, TimeUnit.SECONDS).schedule();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(ie);
@@ -89,7 +89,6 @@ public class DiscordService extends ListenerAdapter {
         if (this.webhookClient != null) this.webhookClient.close();
     }
 
-    // Discord -> Minecraft（単一チャンネルのみ橋渡し）
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
         if (event.getAuthor().isBot()) return;
@@ -106,56 +105,71 @@ public class DiscordService extends ListenerAdapter {
         }).schedule();
     }
 
-    // ===== 送信ユーティリティ =====
-
-    // チャット: Webhook 通常メッセージ（content のみ）、username=[%server%]%player%
+    // Minecraft -> Discord（チャット）
     public void sendChatAsWebhook(String serverName, String playerName, String content) {
         if (webhookClient != null) {
             WebhookMessageBuilder mb = new WebhookMessageBuilder();
             mb.setUsername("[" + serverName + "]" + playerName);
             mb.setContent(content);
-            webhookClient.send(mb.build()); // Webhook の content 投稿[1]
+            webhookClient.send(mb.build());
         } else {
             sendPlain("[" + serverName + "]" + playerName + ": " + content);
         }
     }
 
-    // 起動/停止（既存）: ユーザー名=%server%、本文固定、色=起動:緑/停止:赤
+    // 起動/停止 Embed
     public void sendServerStatusViaWebhook(String serverName, boolean isUp) {
         String body = isUp ? ":white_check_mark:起動しました。" : ":octagonal_sign:停止しました。";
         if (webhookClient != null) {
-            WebhookMessageBuilder mb = new WebhookMessageBuilder();
-            mb.setUsername(serverName);
-            WebhookEmbedBuilder eb = new WebhookEmbedBuilder();
-            eb.setColor(isUp ? 0x2ECC71 : 0xE74C3C);
-            eb.setDescription(body);
+            WebhookMessageBuilder mb = new WebhookMessageBuilder().setUsername(serverName);
+            WebhookEmbedBuilder eb = new WebhookEmbedBuilder()
+                    .setColor(isUp ? 0x2ECC71 : 0xE74C3C)
+                    .setDescription(body);
             mb.addEmbeds(eb.build());
-            webhookClient.send(mb.build()); // Embed 送信[1]
+            webhookClient.send(mb.build());
         } else {
             sendPlain("[" + serverName + "] " + body);
         }
     }
 
-    // 参加/退出: ユーザー名=Velocity、本文=✅/⛔ <player> が参加/退出しました。色=参加:緑/退出:赤
+    // 参加/退出 Embed
     public void sendJoinQuitViaWebhook(String playerName, boolean isJoin) {
         String body = (isJoin ? ":white_check_mark:" : ":octagonal_sign:") + playerName + (isJoin ? "が参加しました。" : "が退出しました。");
         if (webhookClient != null) {
-            WebhookMessageBuilder mb = new WebhookMessageBuilder();
-            mb.setUsername("Velocity");
-            WebhookEmbedBuilder eb = new WebhookEmbedBuilder();
-            eb.setColor(isJoin ? 0x2ECC71 : 0xE74C3C);
-            eb.setDescription(body);
+            WebhookMessageBuilder mb = new WebhookMessageBuilder().setUsername("Velocity");
+            WebhookEmbedBuilder eb = new WebhookEmbedBuilder()
+                    .setColor(isJoin ? 0x2ECC71 : 0xE74C3C)
+                    .setDescription(body);
             mb.addEmbeds(eb.build());
-            webhookClient.send(mb.build()); // Embed 送信（“□”スタイル）[1]
+            webhookClient.send(mb.build());
         } else {
             sendPlain("[Velocity] " + body);
         }
     }
 
-    // Bot フォールバック（非同期）
     public void sendPlain(String text) {
         if (config == null || config.channelId == null) return;
         MessageChannelUnion ch = (jda != null) ? jda.getChannelById(MessageChannelUnion.class, config.channelId) : null;
         if (ch != null && ch.asTextChannel() != null) ch.asTextChannel().sendMessage(text).queue();
+    }
+
+    // 定期 ping 監視
+    private void tickPing() {
+        proxy.getAllServers().forEach(rs -> {
+            String name = rs.getServerInfo().getName();
+            rs.ping().whenComplete((pong, err) -> {
+                boolean isUp = (err == null && pong != null);
+                Boolean prev = lastOnline.get(name);
+                if (prev == null) {
+                    lastOnline.put(name, isUp);
+                    if (isUp) sendServerStatusViaWebhook(name, true);
+                    return;
+                }
+                if (isUp != prev) {
+                    lastOnline.put(name, isUp);
+                    sendServerStatusViaWebhook(name, isUp);
+                }
+            });
+        });
     }
 }
