@@ -3,6 +3,7 @@ package jp.atsukigames.discordbridge;
 import com.google.gson.Gson;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
+import com.velocitypowered.api.proxy.server.RegisteredServer;
 import club.minnced.discord.webhook.WebhookClient;
 import club.minnced.discord.webhook.WebhookClientBuilder;
 import club.minnced.discord.webhook.send.WebhookEmbedBuilder;
@@ -20,9 +21,10 @@ import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 public class DiscordService extends ListenerAdapter {
@@ -42,9 +44,16 @@ public class DiscordService extends ListenerAdapter {
     private JDA jda;
     private WebhookClient webhookClient;
 
-    // 状態保持
-    private final Map<String, Boolean> lastOnline = new HashMap<>();
-    private final Map<String, Integer> downStreak = new HashMap<>(); // 連続失敗回数
+    // 状態保持（並行更新に備えて Concurrent）
+    private final ConcurrentMap<String, Boolean> lastOnline = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Integer> downStreak = new ConcurrentHashMap<>();
+
+    // しきい値
+    private static final int STARTUP_FAILS = 2; // 起動直後 未観測 -> 停止判定に必要な連続失敗回数
+    private static final int RUNTIME_FAILS = 1; // 観測済み 稼働中 -> 停止判定に必要な連続失敗回数
+    private static final long PING_TIMEOUT_SEC = 3;
+    private static final long TICK_INTERVAL_SEC = 10;
+    private static final long FIRST_DELAY_SEC = 5;
 
     public DiscordService(ProxyServer proxy, Logger logger, Path dataDirectory, Object plugin) {
         this.proxy = proxy;
@@ -75,8 +84,15 @@ public class DiscordService extends ListenerAdapter {
                     this.webhookClient = wcb.build();
                 }
 
-                // 10秒ごとに全 RegisteredServer を監視（タイムアウト＋連続失敗で停止判定）
-                proxy.getScheduler().buildTask(plugin, this::tickPing).repeat(10, TimeUnit.SECONDS).schedule();
+                // 起動時ウォームアップ（停止は黙る、起動のみ通知）
+                warmupSnapshot();
+
+                // 監視開始（初回5秒遅延 → 10秒間隔）
+                proxy.getScheduler()
+                        .buildTask(plugin, this::tickPing)
+                        .delay(FIRST_DELAY_SEC, TimeUnit.SECONDS)
+                        .repeat(TICK_INTERVAL_SEC, TimeUnit.SECONDS)
+                        .schedule();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(ie);
@@ -107,7 +123,6 @@ public class DiscordService extends ListenerAdapter {
         }).schedule();
     }
 
-    // Minecraft -> Discord（チャット）
     public void sendChatAsWebhook(String serverName, String playerName, String content) {
         if (webhookClient != null) {
             WebhookMessageBuilder mb = new WebhookMessageBuilder();
@@ -119,7 +134,6 @@ public class DiscordService extends ListenerAdapter {
         }
     }
 
-    // 起動/停止 Embed
     public void sendServerStatusViaWebhook(String serverName, boolean isUp) {
         String body = isUp ? ":white_check_mark:起動しました。" : ":octagonal_sign:停止しました。";
         if (webhookClient != null) {
@@ -134,7 +148,6 @@ public class DiscordService extends ListenerAdapter {
         }
     }
 
-    // 参加/退出 Embed
     public void sendJoinQuitViaWebhook(String playerName, boolean isJoin) {
         String body = (isJoin ? ":white_check_mark:" : ":octagonal_sign:") + playerName + (isJoin ? "が参加しました。" : "が退出しました。");
         if (webhookClient != null) {
@@ -155,33 +168,49 @@ public class DiscordService extends ListenerAdapter {
         if (ch != null && ch.asTextChannel() != null) ch.asTextChannel().sendMessage(text).queue();
     }
 
-    // 定期 ping 監視（3秒タイムアウト、2連続失敗で停止判定）
+    // 起動時ウォームアップ：現在の稼働状況を取得（停止は通知しない）
+    private void warmupSnapshot() {
+        final CountDownLatch latch = new CountDownLatch(proxy.getAllServers().size());
+        for (RegisteredServer rs : proxy.getAllServers()) {
+            final String name = rs.getServerInfo().getName();
+            rs.ping()
+              .orTimeout(PING_TIMEOUT_SEC, TimeUnit.SECONDS)
+              .handle((pong, err) -> {
+                  boolean isUp = (err == null && pong != null);
+                  lastOnline.put(name, isUp);
+                  downStreak.put(name, isUp ? 0 : 1); // すぐに停止判定しないため1から開始
+                  if (isUp) {
+                      sendServerStatusViaWebhook(name, true); // 起動のみ通知
+                  }
+                  latch.countDown();
+                  return null;
+              });
+        }
+        try { latch.await(PING_TIMEOUT_SEC + 2, TimeUnit.SECONDS); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+    }
+
+    // 定期監視：タイムアウト＋連続失敗しきい値で停止判定
     private void tickPing() {
         proxy.getAllServers().forEach(rs -> {
             final String name = rs.getServerInfo().getName();
             rs.ping()
-              .orTimeout(3, TimeUnit.SECONDS)
+              .orTimeout(PING_TIMEOUT_SEC, TimeUnit.SECONDS)
               .handle((pong, err) -> {
                   boolean isUp = (err == null && pong != null);
                   Boolean prev = lastOnline.get(name);
 
                   if (isUp) {
                       downStreak.put(name, 0);
-                      if (prev == null) {
-                          lastOnline.put(name, true);
-                          sendServerStatusViaWebhook(name, true);
-                      } else if (!prev) {
+                      if (prev == null || !prev) {
                           lastOnline.put(name, true);
                           sendServerStatusViaWebhook(name, true);
                       }
                   } else {
+                      int base = (prev != null && prev) ? RUNTIME_FAILS : STARTUP_FAILS;
                       int streak = downStreak.getOrDefault(name, 0) + 1;
                       downStreak.put(name, streak);
-                      if (streak >= 2) { // 2回連続でオフと見なす
-                          if (prev == null) {
-                              lastOnline.put(name, false);
-                              sendServerStatusViaWebhook(name, false);
-                          } else if (prev) {
+                      if (streak >= base) {
+                          if (prev == null || prev) {
                               lastOnline.put(name, false);
                               sendServerStatusViaWebhook(name, false);
                           }
