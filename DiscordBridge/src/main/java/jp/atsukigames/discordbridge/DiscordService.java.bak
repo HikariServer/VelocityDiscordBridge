@@ -79,7 +79,14 @@ public class DiscordService extends ListenerAdapter {
                 this.jda = builder.addEventListeners(this).build();
                 this.jda.awaitReady();
 
-                if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
+                
+// register global slash command /consol (may take up to 1h to propagate)
+this.jda.updateCommands().addCommands(
+  net.dv8tion.jda.api.interactions.commands.build.Commands.slash("consol", "Execute proxy/backend command")
+    .addOption(net.dv8tion.jda.api.interactions.commands.OptionType.STRING, "target", "velocity or server name (s1/s2...)", true)
+    .addOption(net.dv8tion.jda.api.interactions.commands.OptionType.STRING, "command", "the command to run", true)
+).queue();
+if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
                     WebhookClientBuilder wcb = new WebhookClientBuilder(config.webhookUrl);
                     wcb.setDaemon(true);
                     this.webhookClient = wcb.build();
@@ -260,6 +267,22 @@ public class DiscordService extends ListenerAdapter {
             });
         });
     }
+    @Override
+    public void onSlashCommandInteraction(net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent event) {
+        if (!event.getName().equals("consol")) return;
+        if (config == null || config.operation == null || !event.getChannel().getId().equals(config.operation)) {
+            event.reply("このチャンネルでは利用できません。").setEphemeral(true).queue();
+            return;
+        }
+        String target = event.getOption("target").getAsString();
+        String cmd = event.getOption("command").getAsString();
+        if (target.equalsIgnoreCase("velocity")) {
+            executeVelocityCommand(cmd);
+            event.reply("実行しました（velocity）").setEphemeral(true).queue();
+        } else {
+            boolean ok = dispatchServerCommand(target, cmd);
+            event.reply(ok ? "実行しました（" + target + "）" : "サーバーが見つかりません: " + target).setEphemeral(true).queue();
+        }
+    }
 }
-
 

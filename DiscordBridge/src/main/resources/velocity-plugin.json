@@ -1,10 +1,11 @@
 {
   "id": "discordbridge",
   "name": "DiscordBridge",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "authors": ["AtsukiGames"],
   "main": "jp.atsukigames.discordbridge.DiscordBridgeVelocity"
 }
+
 
 
 

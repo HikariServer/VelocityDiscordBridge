@@ -36,12 +36,10 @@ public final class DiscordBridgeVelocity {
         try {
             Files.createDirectories(dataDirectory.resolve("config"));
         } catch (Exception ignored) {}
-        proxy.getChannelRegistrar().register(DiscordService.CONSOL_CHANNEL);
-
         this.discord = new DiscordService(proxy, java.util.logging.Logger.getLogger("DiscordBridge"), dataDirectory, this);
         discord.start().whenComplete((v, ex) -> {
             if (ex == null) {
-                discord.sendServerStatusViaWebhook("Velocity", true);
+                discord.sendServerStatusViaWebhook("Velocity", true); // 起動: 緑帯[2][4]
             } else {
                 logger.error("Discord bot failed to start: {}", ex.getMessage());
             }
@@ -52,7 +50,7 @@ public final class DiscordBridgeVelocity {
     public void onShutdown(ProxyShutdownEvent e) {
         try {
             if (discord != null) {
-                discord.sendServerStatusViaWebhookSync("Velocity", false);
+                discord.sendServerStatusViaWebhook("Velocity", false); // 停止: 赤帯[2][4]
             }
         } catch (Exception ignored) {}
         if (discord != null) {
@@ -64,7 +62,7 @@ public final class DiscordBridgeVelocity {
     public void onServerRegistered(ServerRegisteredEvent e) {
         String name = e.registeredServer().getServerInfo().getName();
         if (discord != null) {
-            discord.sendServerStatusViaWebhook(name, true);
+            discord.sendServerStatusViaWebhook(name, true); // バックエンド起動[2]
         }
     }
 
@@ -72,33 +70,31 @@ public final class DiscordBridgeVelocity {
     public void onServerUnregistered(ServerUnregisteredEvent e) {
         String name = e.unregisteredServer().getServerInfo().getName();
         if (discord != null) {
-            discord.sendServerStatusViaWebhook(name, false);
+            discord.sendServerStatusViaWebhook(name, false); // バックエンド停止[2]
         }
     }
 
+    // 参加: PostLoginEvent で Embed 送信
     @Subscribe
     public void onJoin(PostLoginEvent e) {
-        Player p = e.getPlayer();
-        String msg = p.getUsername() + "が参加しました。";
         if (discord != null) {
-            discord.sendPlain(msg);
+            discord.sendJoinQuitViaWebhook(e.getPlayer().getUsername(), true); // 参加通知（Embed）[2][3]
         }
     }
 
+    // 退出: DisconnectEvent で Embed 送信（非同期発火に留意）
     @Subscribe
     public void onQuit(DisconnectEvent e) {
-        Player p = e.getPlayer();
-        String msg = p.getUsername() + "が退出しました。";
         if (discord != null) {
-            discord.sendPlain(msg);
+            discord.sendJoinQuitViaWebhook(e.getPlayer().getUsername(), false); // 退出通知（Embed）[3]
         }
     }
 
+    // サーバー移動通知は無効化
     @Subscribe
-    public void onServerMove(ServerPostConnectEvent e) {
-        // disabled by design
-    }
+    public void onServerMove(ServerPostConnectEvent e) {}
 
+    // ゲーム内チャット → Discord（Webhookで[%server%]%player%名義）
     @Subscribe
     public void onChat(PlayerChatEvent e) {
         Player p = e.getPlayer();
@@ -106,7 +102,7 @@ public final class DiscordBridgeVelocity {
                 .map(cs -> cs.getServerInfo().getName())
                 .orElse("unknown");
         if (discord != null) {
-            discord.sendChatAsWebhook(serverName, p.getUsername(), e.getMessage());
+            discord.sendChatAsWebhook(serverName, p.getUsername(), e.getMessage()); // 通常メッセージ（content）[1]
         }
     }
 }

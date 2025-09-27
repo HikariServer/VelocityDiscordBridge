@@ -1,12 +1,8 @@
 package jp.atsukigames.discordbridge;
 
 import com.google.gson.Gson;
-import com.velocitypowered.api.command.CommandManager;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
-import com.velocitypowered.api.proxy.server.RegisteredServer;
-import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
-import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import club.minnced.discord.webhook.WebhookClient;
 import club.minnced.discord.webhook.WebhookClientBuilder;
 import club.minnced.discord.webhook.send.WebhookEmbedBuilder;
@@ -20,27 +16,19 @@ import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 public class DiscordService extends ListenerAdapter {
-    public static final ChannelIdentifier CONSOL_CHANNEL = MinecraftChannelIdentifier.from("atsukigames:consol");
-
     public static class Config {
         public String botToken;
-        public String channelId;   // チャット橋渡し
+        public String channelId;   // Discord->MC ブリッジ
         public String webhookUrl;  // Webhook 宛先
-        public String operation;   // /consol 許可チャンネル
         public boolean enableMessageContentIntent = true;
     }
 
@@ -52,7 +40,6 @@ public class DiscordService extends ListenerAdapter {
     private Config config;
     private JDA jda;
     private WebhookClient webhookClient;
-    private final Map<String, Boolean> lastOnline = new HashMap<>();
 
     public DiscordService(ProxyServer proxy, Logger logger, Path dataDirectory, Object plugin) {
         this.proxy = proxy;
@@ -68,6 +55,7 @@ public class DiscordService extends ListenerAdapter {
         }
     }
 
+    // 起動: JDA 準備 + Webhook 準備
     public CompletableFuture<Void> start() {
         return CompletableFuture.runAsync(() -> {
             try {
@@ -79,21 +67,14 @@ public class DiscordService extends ListenerAdapter {
                 this.jda = builder.addEventListeners(this).build();
                 this.jda.awaitReady();
 
-                
-// register global slash command /consol (may take up to 1h to propagate)
-this.jda.updateCommands().addCommands(
-  net.dv8tion.jda.api.interactions.commands.build.Commands.slash("consol", "Execute proxy/backend command")
-    .addOption(net.dv8tion.jda.api.interactions.commands.OptionType.STRING, "target", "velocity or server name (s1/s2...)", true)
-    .addOption(net.dv8tion.jda.api.interactions.commands.OptionType.STRING, "command", "the command to run", true)
-).queue();
-if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
+                if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
                     WebhookClientBuilder wcb = new WebhookClientBuilder(config.webhookUrl);
                     wcb.setDaemon(true);
-                    this.webhookClient = wcb.build();
+                    this.webhookClient = wcb.build(); // Webhook 経由で Embed 送信[1]
                 }
 
-                proxy.getScheduler().buildTask(plugin, this::tickPing)
-                        .repeat(10, TimeUnit.SECONDS).schedule();
+                // まだ必要な定期処理があればここでスケジュール
+                proxy.getScheduler().buildTask(plugin, () -> {}).repeat(60, TimeUnit.SECONDS).schedule();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(ie);
@@ -108,44 +89,12 @@ if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
         if (this.webhookClient != null) this.webhookClient.close();
     }
 
+    // Discord -> Minecraft（単一チャンネルのみ橋渡し）
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
         if (event.getAuthor().isBot()) return;
-        if (config == null) return;
-
-        String cid = event.getChannel().getId();
-
-        // /consol <target> "<command>" （operation チャンネル限定）
-        String raw = event.getMessage().getContentRaw();
-        if (raw.startsWith("/consol ")) {
-            if (config.operation == null || !cid.equals(config.operation)) {
-                event.getMessage().reply("このチャンネルでは利用できません。").queue();
-                return;
-            }
-            String rest = raw.substring(8).trim();
-            int sp = rest.indexOf(' ');
-            if (sp <= 0) {
-                event.getMessage().reply("形式: /consol <target> \"<command>\"").queue();
-                return;
-            }
-            String target = rest.substring(0, sp).trim();
-            String cmd = rest.substring(sp + 1).trim();
-            if (cmd.startsWith("\"") && cmd.endsWith("\"") && cmd.length() >= 2) {
-                cmd = cmd.substring(1, cmd.length() - 1);
-            }
-
-            if (target.equalsIgnoreCase("velocity")) {
-                executeVelocityCommand(cmd);
-                event.getMessage().reply("実行しました（velocity）").queue();
-            } else {
-                boolean ok = dispatchServerCommand(target, cmd);
-                event.getMessage().reply(ok ? "実行しました（" + target + "）" : "サーバーが見つかりません: " + target).queue();
-            }
-            return;
-        }
-
-        // チャット橋渡し（指定チャンネルのみ）
-        if (config.channelId == null || !cid.equals(config.channelId)) return;
+        if (config == null || config.channelId == null) return;
+        if (!event.getChannel().getId().equals(config.channelId)) return;
 
         String display = (event.getMember() != null) ? event.getMember().getEffectiveName() : event.getAuthor().getName();
         String content = event.getMessage().getContentDisplay();
@@ -157,21 +106,21 @@ if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
         }).schedule();
     }
 
-    // ===== Webhook 送信ユーティリティ =====
+    // ===== 送信ユーティリティ =====
 
-    // チャット: 通常メッセージ（content のみ）、username=[%server%]%player%
+    // チャット: Webhook 通常メッセージ（content のみ）、username=[%server%]%player%
     public void sendChatAsWebhook(String serverName, String playerName, String content) {
         if (webhookClient != null) {
             WebhookMessageBuilder mb = new WebhookMessageBuilder();
             mb.setUsername("[" + serverName + "]" + playerName);
             mb.setContent(content);
-            webhookClient.send(mb.build());
+            webhookClient.send(mb.build()); // Webhook の content 投稿[1]
         } else {
             sendPlain("[" + serverName + "]" + playerName + ": " + content);
         }
     }
 
-    // 起動/停止: ユーザー名=%server%、本文固定、Embed 色=起動:緑/停止:赤
+    // 起動/停止（既存）: ユーザー名=%server%、本文固定、色=起動:緑/停止:赤
     public void sendServerStatusViaWebhook(String serverName, boolean isUp) {
         String body = isUp ? ":white_check_mark:起動しました。" : ":octagonal_sign:停止しました。";
         if (webhookClient != null) {
@@ -181,108 +130,32 @@ if (config.webhookUrl != null && !config.webhookUrl.isBlank()) {
             eb.setColor(isUp ? 0x2ECC71 : 0xE74C3C);
             eb.setDescription(body);
             mb.addEmbeds(eb.build());
-            webhookClient.send(mb.build());
+            webhookClient.send(mb.build()); // Embed 送信[1]
         } else {
             sendPlain("[" + serverName + "] " + body);
         }
     }
 
-    // 停止時など確実に届けたい Embed 同期送信（Velocity 停止に使用）
-    public void sendServerStatusViaWebhookSync(String serverName, boolean isUp) {
-        String body = isUp ? ":white_check_mark:起動しました。" : ":octagonal_sign:停止しました。";
-        try {
-            if (webhookClient != null) {
-                WebhookMessageBuilder mb = new WebhookMessageBuilder();
-                mb.setUsername(serverName);
-                WebhookEmbedBuilder eb = new WebhookEmbedBuilder();
-                eb.setColor(isUp ? 0x2ECC71 : 0xE74C3C);
-                eb.setDescription(body);
-                mb.addEmbeds(eb.build());
-                webhookClient.send(mb.build()).join();
-            } else {
-                sendPlainSync("[" + serverName + "] " + body);
-            }
-        } catch (Exception ignored) {}
+    // 参加/退出: ユーザー名=Velocity、本文=✅/⛔ <player> が参加/退出しました。色=参加:緑/退出:赤
+    public void sendJoinQuitViaWebhook(String playerName, boolean isJoin) {
+        String body = (isJoin ? ":white_check_mark:" : ":octagonal_sign:") + playerName + (isJoin ? "が参加しました。" : "が退出しました。");
+        if (webhookClient != null) {
+            WebhookMessageBuilder mb = new WebhookMessageBuilder();
+            mb.setUsername("Velocity");
+            WebhookEmbedBuilder eb = new WebhookEmbedBuilder();
+            eb.setColor(isJoin ? 0x2ECC71 : 0xE74C3C);
+            eb.setDescription(body);
+            mb.addEmbeds(eb.build());
+            webhookClient.send(mb.build()); // Embed 送信（“□”スタイル）[1]
+        } else {
+            sendPlain("[Velocity] " + body);
+        }
     }
 
+    // Bot フォールバック（非同期）
     public void sendPlain(String text) {
         if (config == null || config.channelId == null) return;
         MessageChannelUnion ch = (jda != null) ? jda.getChannelById(MessageChannelUnion.class, config.channelId) : null;
-        if (ch != null) ch.asTextChannel().sendMessage(text).queue();
-    }
-
-    public void sendPlainSync(String text) {
-        if (config == null) return;
-        try {
-            if (config.channelId != null && jda != null) {
-                MessageChannelUnion ch = jda.getChannelById(MessageChannelUnion.class, config.channelId);
-                if (ch != null) ch.asTextChannel().sendMessage(text).complete();
-            }
-        } catch (Exception ignored) {}
-    }
-
-    // ===== コマンド実行 =====
-
-    public void executeVelocityCommand(String commandLine) {
-        CommandManager cm = proxy.getCommandManager();
-        cm.executeAsync(proxy.getConsoleCommandSource(), commandLine);
-    }
-
-    public boolean dispatchServerCommand(String serverName, String commandLine) {
-        Optional<RegisteredServer> rs = proxy.getAllServers().stream()
-                .filter(s -> s.getServerInfo().getName().equalsIgnoreCase(serverName))
-                .findFirst();
-        if (rs.isEmpty()) return false;
-
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream dos = new DataOutputStream(baos);
-            dos.writeUTF("EXEC");
-            dos.writeUTF(commandLine);
-            dos.flush();
-            rs.get().sendPluginMessage(CONSOL_CHANNEL, baos.toByteArray());
-            return true;
-        } catch (Exception e) {
-            logger.warning("dispatchServerCommand failed: " + e.getMessage());
-            return false;
-        }
-    }
-
-    // バックエンドのオンライン/オフライン遷移検知（10秒間隔）
-    private void tickPing() {
-        proxy.getAllServers().forEach(rs -> {
-            String name = rs.getServerInfo().getName();
-            rs.ping().whenComplete((pong, err) -> {
-                boolean isUp = (err == null && pong != null);
-                Boolean prev = lastOnline.get(name);
-                if (prev == null) {
-                    lastOnline.put(name, isUp);
-                    if (isUp) sendServerStatusViaWebhook(name, true);
-                    return;
-                }
-                if (isUp != prev) {
-                    lastOnline.put(name, isUp);
-                    sendServerStatusViaWebhook(name, isUp);
-                }
-            });
-        });
-    }
-    @Override
-    public void onSlashCommandInteraction(net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent event) {
-        if (!event.getName().equals("consol")) return;
-        if (config == null || config.operation == null || !event.getChannel().getId().equals(config.operation)) {
-            event.reply("このチャンネルでは利用できません。").setEphemeral(true).queue();
-            return;
-        }
-        String target = event.getOption("target").getAsString();
-        String cmd = event.getOption("command").getAsString();
-        if (target.equalsIgnoreCase("velocity")) {
-            executeVelocityCommand(cmd);
-            event.reply("実行しました（velocity）").setEphemeral(true).queue();
-        } else {
-            boolean ok = dispatchServerCommand(target, cmd);
-            event.reply(ok ? "実行しました（" + target + "）" : "サーバーが見つかりません: " + target).setEphemeral(true).queue();
-        }
+        if (ch != null && ch.asTextChannel() != null) ch.asTextChannel().sendMessage(text).queue();
     }
 }
-

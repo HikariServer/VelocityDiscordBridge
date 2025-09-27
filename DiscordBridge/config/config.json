@@ -2,6 +2,5 @@
   "botToken": "PASTE_NEW_BOT_TOKEN_HERE",
   "channelId": "000000000000000000",
   "enableMessageContentIntent": true,
-  "webhookUrl": "PUT_WEBHOOK_URL_HERE",
-  "operation": "PUT_OPERATION_CHANNEL_ID"
+  "webhookUrl": "PUT_WEBHOOK_URL_HERE"
 }
