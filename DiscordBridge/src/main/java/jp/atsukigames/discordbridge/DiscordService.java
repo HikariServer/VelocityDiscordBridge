@@ -22,8 +22,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.Logger;
 
 public class DiscordService extends ListenerAdapter {
@@ -42,7 +41,10 @@ public class DiscordService extends ListenerAdapter {
     private Config config;
     private JDA jda;
     private WebhookClient webhookClient;
+
+    // 状態保持
     private final Map<String, Boolean> lastOnline = new HashMap<>();
+    private final Map<String, Integer> downStreak = new HashMap<>(); // 連続失敗回数
 
     public DiscordService(ProxyServer proxy, Logger logger, Path dataDirectory, Object plugin) {
         this.proxy = proxy;
@@ -73,7 +75,7 @@ public class DiscordService extends ListenerAdapter {
                     this.webhookClient = wcb.build();
                 }
 
-                // 10秒ごとに全 RegisteredServer を ping して状態遷移を検出
+                // 10秒ごとに全 RegisteredServer を監視（タイムアウト＋連続失敗で停止判定）
                 proxy.getScheduler().buildTask(plugin, this::tickPing).repeat(10, TimeUnit.SECONDS).schedule();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -153,23 +155,40 @@ public class DiscordService extends ListenerAdapter {
         if (ch != null && ch.asTextChannel() != null) ch.asTextChannel().sendMessage(text).queue();
     }
 
-    // 定期 ping 監視
+    // 定期 ping 監視（3秒タイムアウト、2連続失敗で停止判定）
     private void tickPing() {
         proxy.getAllServers().forEach(rs -> {
-            String name = rs.getServerInfo().getName();
-            rs.ping().whenComplete((pong, err) -> {
-                boolean isUp = (err == null && pong != null);
-                Boolean prev = lastOnline.get(name);
-                if (prev == null) {
-                    lastOnline.put(name, isUp);
-                    if (isUp) sendServerStatusViaWebhook(name, true);
-                    return;
-                }
-                if (isUp != prev) {
-                    lastOnline.put(name, isUp);
-                    sendServerStatusViaWebhook(name, isUp);
-                }
-            });
+            final String name = rs.getServerInfo().getName();
+            rs.ping()
+              .orTimeout(3, TimeUnit.SECONDS)
+              .handle((pong, err) -> {
+                  boolean isUp = (err == null && pong != null);
+                  Boolean prev = lastOnline.get(name);
+
+                  if (isUp) {
+                      downStreak.put(name, 0);
+                      if (prev == null) {
+                          lastOnline.put(name, true);
+                          sendServerStatusViaWebhook(name, true);
+                      } else if (!prev) {
+                          lastOnline.put(name, true);
+                          sendServerStatusViaWebhook(name, true);
+                      }
+                  } else {
+                      int streak = downStreak.getOrDefault(name, 0) + 1;
+                      downStreak.put(name, streak);
+                      if (streak >= 2) { // 2回連続でオフと見なす
+                          if (prev == null) {
+                              lastOnline.put(name, false);
+                              sendServerStatusViaWebhook(name, false);
+                          } else if (prev) {
+                              lastOnline.put(name, false);
+                              sendServerStatusViaWebhook(name, false);
+                          }
+                      }
+                  }
+                  return null;
+              });
         });
     }
 }
